@@ -1,0 +1,384 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load libraries
+```{r}
+library(rtracklayer)
+library(tidyverse)
+library(GenomicRanges)
+library(DESeq2)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(seriation)
+library(rtracklayer)
+```
+
+# Load consensus peak annotation, featureCounts output, and gene annotation
+```{r}
+setwd("/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667")
+
+peak_annotation <- read.table("/scratch/Shares/rinn/lincxpress/LINC00667/atacseq/results_broad/bwa/merged_replicate/macs2/broad_peak/consensus/consensus_peaks.mRp.clN.annotatePeaks.txt", sep = "\t", header = T)
+colnames(peak_annotation)[1] <- "interval_id"
+# Check the data types of each column
+print(sapply(peak_annotation, class))
+# Check if any peaks are unannotated
+print(sum(peak_annotation$Annotation == "Unannotated" | is.na(peak_annotation$Annotation)))
+
+LINC00667_peak_counts <- read.table("/scratch/Shares/rinn/lincxpress/LINC00667/atacseq/results_broad/bwa/merged_replicate/macs2/broad_peak/consensus/consensus_peaks.mRp.clN.featureCounts.txt", sep = "\t", header = TRUE, skip = 1)
+# Distribution of counts across samples
+print(summary(LINC00667_peak_counts[, -c(1:6)]))
+# Check peak distribution per chr -> remove any nonstandard Chr?
+print(table(LINC00667_peak_counts$Chr))
+# Check for reasonable peak lenghts
+print(summary(LINC00667_peak_counts$Length))
+
+#gencode <- rtracklayer::import(file.path("/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gtf"))
+#genes <- gencode[gencode$type == "gene"]
+#rtracklayer::export(genes, "/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gene.gtf")
+genes <- rtracklayer::import(file.path("/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gene.gtf"))
+names(genes) <- genes$gene_id
+# Remove pseudogenes
+genes <- genes[!grepl("pseudogene", genes$gene_type), ]
+ 
+save(peak_annotation, LINC00667_peak_counts, genes, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/results/LINC00667_atac_merged_replicate_broad.RData")
+```
+
+#Clean up and factor peak counts
+```{r}
+colnames(LINC00667_peak_counts) <- gsub(".mLb.clN.sorted.bam","",colnames(LINC00667_peak_counts))
+rownames(LINC00667_peak_counts) <- LINC00667_peak_counts$Geneid
+LINC00667_peak_counts <- LINC00667_peak_counts[, 7:ncol(LINC00667_peak_counts), drop = FALSE] %>% as.matrix()
+
+col_data <- data.frame("sample_name" = colnames(LINC00667_peak_counts)) 
+
+col_data$sample_name <- gsub("LINC00667\\.(\\d+(\\.\\d+)?h)_REP1", "LINC00667_\\1_REP1", col_data$sample_name)
+col_data$sample_name <- gsub("LINC00667\\.(\\d+(\\.\\d+)?h)_REP2", "LINC00667_\\1_REP2", col_data$sample_name)
+col_data$sample_name <- gsub("LINC00667\\.(\\d+(\\.\\d+)?h)_REP3", "LINC00667_\\1_REP3", col_data$sample_name)
+col_data$timepoint <- gsub(".*?_(\\d+\\.?\\d*h?)_REP[123]", "\\1", col_data$sample_name)
+#col_data$timepoint <- gsub(".*?\\.(\\d+\\.?\\d*h?)_REP[123]", "\\1", col_data$sample_name)
+col_data$condition <- ifelse(grepl("0h", col_data$timepoint), "control", 
+                     ifelse(grepl("GFP", col_data$sample_name), "control", "LINC00667"))
+col_data$transgene <- ifelse(grepl("GFP", col_data$sample_name), "GFP", "LINC00667")
+
+col_data$condition <- factor(col_data$condition, levels = c("control", "LINC00667"))
+col_data$transgene <- factor(col_data$transgene, levels = c("GFP", "LINC00667"))
+col_data$timepoint <- factor(col_data$timepoint, levels = c("0h", "0.5h", "1h", "1.5h", "2h", "2.5h"))
+levels(col_data$timepoint)
+levels(col_data$condition)
+levels(col_data$transgene)
+
+col_data$original <- data.frame("sample_name" = colnames(LINC00667_peak_counts))
+
+```
+
+#LRT
+```{r}
+stopifnot(all(colnames(LINC00667_peak_counts) == col_data$original$sample_name))
+
+LINC00667_atac_dds <- DESeqDataSetFromMatrix(countData = LINC00667_peak_counts, 
+                                            colData = col_data, 
+                                            design = ~ timepoint + transgene + timepoint : transgene)
+
+LINC00667_atac_dds <- DESeq(LINC00667_atac_dds, test = "LRT", reduced = ~ timepoint + transgene)
+
+
+resultsNames(LINC00667_atac_dds)
+
+LINC00667_atac_res <- resultsNames(LINC00667_atac_dds)
+LINC00667_atac_res <- LINC00667_atac_res[grepl("transgeneLINC00667", LINC00667_atac_res)]
+  
+LINC00667_atac_lfc <- lapply(LINC00667_atac_res, function(x) {
+    results(LINC00667_atac_dds, name = x) %>%
+      as.data.frame() %>%
+      rownames_to_column("interval_id") %>% 
+      mutate(result_name = x,
+             timepoint = as.numeric(sub("timepoint(\\d+\\.?\\d*)h.transgeneLINC00667", "\\1", result_name)))
+  }) %>% bind_rows() %>% merge(peak_annotation %>% 
+            dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                          Distance.to.TSS, Chr, Start, End)) %>% 
+    unite(ucsc_coord, Chr, Start, remove = FALSE, sep = ":") %>%
+    unite(ucsc_coord, ucsc_coord, End, sep = "-", remove = FALSE)
+
+  names(LINC00667_atac_lfc)[10] <- "gene_name"
+  names(LINC00667_atac_lfc)[11] <- "gene_id"
+
+#hist(LINC00667_atac_lfc$padj)
+
+length(unique(LINC00667_atac_lfc$interval_id))
+#344499
+ LINC00667_atac_lfc<- LINC00667_atac_lfc %>% 
+  filter(padj <= 0.01)
+  print(length(unique(LINC00667_atac_lfc$interval_id)))
+  #12886
+  save(LINC00667_atac_dds, LINC00667_atac_lfc, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/results/broad_LINC00667_timepoint_atac_dds.RData")
+```
+
+```{r}
+# Calculate the maximum fold-change in any one timepoint
+  LINC00667_atac_maxlfc <- LINC00667_atac_lfc %>%
+    group_by(interval_id) %>%
+    summarize(max_fc = max(abs(log2FoldChange))) 
+  
+# merge max lfc into dataframe
+  LINC00667_atac_lfc <- LINC00667_atac_lfc %>%
+    left_join(LINC00667_atac_maxlfc)
+  
+# Calculate the sum_fc
+  LINC00667_atac_lfc_sum_fc <- LINC00667_atac_lfc %>%
+    group_by(interval_id) %>%
+    summarize(sum_fc = sum(log2FoldChange)) 
+  
+# merge sum_fc into dataframe
+  LINC00667_atac_lfc <- LINC00667_atac_lfc %>%
+    left_join(LINC00667_atac_lfc_sum_fc)
+
+#calculate zscore
+  LINC00667_atac_lfc <- LINC00667_atac_lfc %>%
+  mutate(zscore = as.numeric(scale(max_fc, center = TRUE, scale = TRUE))) 
+
+#check log2FC at zscore=0.05
+  find_zscore <- LINC00667_atac_lfc %>%
+  filter(zscore < 0.05)
+  
+largest_max_fc <- max(find_zscore$max_fc, na.rm = TRUE)
+
+print(largest_max_fc)
+#0.71  
+LINC00667_atac_sig <- LINC00667_atac_lfc %>%
+  filter(max_fc >= 0.71)
+
+length(unique(LINC00667_atac_sig$interval_id))
+  #5667
+ 
+save(LINC00667_atac_dds, LINC00667_atac_lfc, LINC00667_atac_sig, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/results/broad_LINC00667_timepoint_atac_sig.RData")
+```
+
+```{r}
+load("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/LINC00667/results/LINC00667_rnaseq_list_for_atacseq.RData")
+
+
+length(unique(LINC00667_trend_sig_filtered$gene_name))
+#192
+
+peak_annotation_gr <- GRanges(seqnames = peak_annotation$Chr,
+                             IRanges(start = peak_annotation$Start,
+                                     end = peak_annotation$End),
+                             interval_id = peak_annotation$interval_id)
+
+sig_atac_gr <- peak_annotation_gr[peak_annotation_gr$interval_id %in% unique(LINC00667_atac_sig$interval_id)]
+
+# making a promoters GenomicRanges with promoters function
+promoters_gr <- promoters(genes, upstream = 1, downstream = 1)
+promoters_df <- promoters_gr %>% as.data.frame() %>%
+  
+  # taking all genes except processed pseudogenes
+  filter(gene_type %in% c("protein_coding", "processed_transcript", "bidirectional_promoter_lncRNA",
+                          "antisense", "lincRNA", "sense_intronic"))
+
+# finding overlaps of promoter regions in promoters_df
+promoters_gr <- promoters_gr[promoters_gr$gene_id %in%promoters_df$gene_id]
+
+# establishing peak centers building Ranges for sig atac peaks
+# divide peak by two adn connect to start point
+peak_centers <- start(sig_atac_gr) + round(width(sig_atac_gr)/2)
+sig_atac_center <- GRanges(seqnames = seqnames(sig_atac_gr),
+                           ranges = IRanges(start = peak_centers,
+                                            end = peak_centers),
+                           # naming peak
+                           interval_id = sig_atac_gr$interval_id)
+
+# setting peak to 50Kb up and downstream from peak center
+offset <- 5e4
+
+# creating 10Kb up and downstream of peak center with offset
+# NOTE if you run twice it will affet the results !!
+# Start and end are accessor functions to go into these values
+start(sig_atac_center) <- start(sig_atac_center) - offset
+end(sig_atac_center) <- end(sig_atac_center) + offset
+
+# overlaps with TSS for sig atac peak centers
+# NOTE the ordering of overlaps matters for the lines below
+peak_tss_overlaps <- findOverlaps(promoters_gr, sig_atac_center)
+
+# making Granges into data frame
+atac_df <- sig_atac_center %>% as.data.frame()
+promoters_df <- promoters_gr %>% as.data.frame()
+
+# finding a bunch of overlapping features with atac peak centers 
+# @to is atac sig GR @ from is promters GR
+overlapping_df <- atac_df[peak_tss_overlaps@to, ]
+overlapping_df$gene_id <- promoters_df$gene_id[peak_tss_overlaps@from]
+overlapping_df$gene_name <- promoters_df$gene_name[peak_tss_overlaps@from]
+overlapping_df$gene_tss <- promoters_df$start[peak_tss_overlaps@from]
+overlapping_df$gene_chr <- promoters_df$seqnames[peak_tss_overlaps@from]
+overlapping_df$gene_strand <- promoters_df$strand[peak_tss_overlaps@from]
+
+# calculating distance from TSS
+# subtracting peak center from the TSS to find distance*
+overlapping_df <- overlapping_df %>%
+  mutate(dist_to_tss = gene_tss - (start+offset),
+         dist_to_peak = (start+offset) - gene_tss)
+
+# some distances are positive and negative depending on up or down stream
+# fixing to plot so they are all in the same 
+# Flip the minus strand differences so that it's a TSS centric view
+overlapping_df[overlapping_df$gene_strand == "-", "dist_to_peak"] <- -1* overlapping_df[overlapping_df$gene_strand == "-", "dist_to_peak"] 
+
+# finding overlaps with sig genes in short combined
+overlapping_df$deg <- overlapping_df$gene_name %in%LINC00667_trend_sig_filtered$gene_name
+length(unique(overlapping_df$interval_id))
+
+overlapping_df_filtered <- 
+  overlapping_df %>% 
+  filter(deg == TRUE)
+length(unique(overlapping_df_filtered$gene_name))
+#79
+length(unique(overlapping_df_filtered$interval_id))
+#106
+LINC00667_atac_lfc_overlap_peaks <- 
+  LINC00667_atac_lfc %>% 
+  filter(interval_id %in% overlapping_df_filtered$interval_id)
+
+length(unique(LINC00667_atac_lfc_overlap_peaks$interval_id))
+  
+   # Ensure unique interval_id-to-gene_name mapping in overlapping_df_filtered
+overlapping_df_filtered_unique <- overlapping_df_filtered %>%
+   filter(deg == TRUE) %>%
+  group_by(interval_id) %>%
+  summarise(gene_name = paste(unique(gene_name), collapse = ";"), .groups = "drop")
+
+# Perform the join with the unique overlapping_df_filtered
+LINC00667_atac_lfc_overlap_peaks_updated <- LINC00667_atac_lfc_overlap_peaks %>%
+  left_join(overlapping_df_filtered_unique, by = "interval_id") %>%
+  mutate(gene_name = coalesce(gene_name.y, gene_name.x)) %>%
+  select(-gene_name.x, -gene_name.y)
+
+# View the updated data
+head(LINC00667_atac_lfc_overlap_peaks_updated)
+
+#change Distance.to.TSS to gr annotated dist_to_tss
+LINC00667_atac_lfc_overlap_peaks_updated <- LINC00667_atac_lfc_overlap_peaks_updated %>%
+  left_join(overlapping_df_filtered %>% select(interval_id, dist_to_tss), by = "interval_id") %>%
+  mutate(Distance.to.TSS = dist_to_tss) %>%
+  select(-dist_to_tss)  # Remove the added column if no longer needed
+
+# Create the unique_mapping with added RNA-seq trend, ATAC-seq trend, and picked_by_eye
+unique_mapping <- LINC00667_atac_lfc_overlap_peaks_updated %>%
+  distinct(sum_fc, gene_name, interval_id) %>%
+  rowwise() %>%  # Ensure row-wise operations for `case_when` involving `str_split`
+  mutate(
+    # Mark RNA-seq trend as "down" if gene_name is in LINC00667_trend_sig_down, otherwise mark as "up"
+    rna_seq_trend = case_when(
+      any(str_split(gene_name, ";")[[1]] %in% LINC00667_trend_sig_down_filtered$gene_name) ~ "down",
+      any(str_split(gene_name, ";")[[1]] %in% LINC00667_trend_sig_up_filtered$gene_name) ~ "up",
+      TRUE ~ "unknown"  # If gene_name matches neither list, mark as "unknown"
+    ),
+    
+    # Mark ATAC-seq trend based on sum_fc
+    atac_seq_trend = case_when(
+      sum_fc > 0 ~ "up",
+      sum_fc < 0 ~ "down",
+      TRUE ~ "unknown"  # If sum_fc is 0, mark as "unknown"
+    ),
+    
+    # Check if RNA-seq and ATAC-seq trends are the same
+    same_trend = case_when(
+      rna_seq_trend == atac_seq_trend ~ "same",  # If trends are the same, mark as "same"
+      TRUE ~ "different"  # Otherwise mark as "different"
+    ),
+  ) %>%
+  ungroup()  # Reset row-wise grouping
+
+
+# View the result
+head(unique_mapping)
+num_matches <- sum(unique_mapping$same_trend == "same")
+#65
+unique_mapping_match <- unique_mapping %>%
+   filter(same_trend == "same") %>%
+  group_by(interval_id)
+
+LINC00667_atac_match_peaks <- LINC00667_atac_lfc_overlap_peaks_updated %>%
+  filter(interval_id %in% unique_mapping_match$interval_id)
+write.csv(LINC00667_atac_match_peaks, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/results/LINC00667_atac_match_peaks.csv")
+
+print(unique_mapping_match$interval_id)
+length(unique(unique_mapping_match$gene_name))
+#47
+
+LINC00667_atac_lfc_overlap_peaks_updated <- LINC00667_atac_lfc_overlap_peaks_updated %>%
+  left_join(overlapping_df_filtered %>% select(interval_id, dist_to_tss), by = "interval_id") 
+  
+save(overlapping_df, overlapping_df_filtered, LINC00667_atac_lfc_overlap_peaks, LINC00667_atac_lfc_overlap_peaks_updated, LINC00667_atac_match_peaks,file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/results/broad_LINC00667_overlappin_peaks.RData")
+
+
+```
+
+```{r}
+LINC00667_atac_dds <- estimateSizeFactors(LINC00667_atac_dds)
+all_counts<-counts(LINC00667_atac_dds, normalized=TRUE) 
+all_counts <- as.data.frame(all_counts)
+all_counts <- rownames_to_column(all_counts)
+colnames(all_counts)[colnames(all_counts) == "rowname"] <- "interval_id"
+
+#all_counts_filtered <- all_counts %>% 
+#  filter(interval_id %in% unique_mapping_match$interval_id)
+
+all_counts_filtered <- all_counts %>% 
+  filter(interval_id %in% unique_mapping$interval_id)
+
+all_counts_filtered_long <- all_counts_filtered %>%
+     pivot_longer(
+       cols = -interval_id,  # Assuming 'gene_id' or a similar identifier column exists
+       names_to = c("condition", "time_point", "replicate"),
+       names_pattern = "^(LINC00667|GFP)[._](\\d+(?:\\.\\d+)?h?)[._]REP(\\d+)$",
+       values_to = "counts"
+    ) %>%
+     mutate(
+        time_point = as.numeric(gsub("h", "", time_point)), 
+        replicate = as.numeric(replicate),
+        condition = ifelse(condition == "novageneGFP", "GFP", condition) 
+    )
+
+#all_counts_filtered_long <- all_counts_filtered_long %>%
+#  left_join(unique_mapping_match)
+
+#get all peak that changed not considering if it match RNAseq pattern or not
+all_counts_filtered_long <- all_counts_filtered_long %>%
+  left_join(unique_mapping)
+
+ggplot(all_counts_filtered_long, aes(x = time_point, y = counts, color = condition, linetype = condition)) +
+  geom_point(alpha = 0.7) +
+  stat_summary(fun = mean, geom = "line") +
+  facet_wrap(~ gene_name + interval_id, scales = "free_y") +
+  labs(
+    x = "Time Point (h)", 
+    y = "Peak Counts", 
+    color = "Condition"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("LINC00667" = "darkred", "GFP" = "blue")) +
+  scale_linetype_manual(values = c("LINC00667" = "solid", "GFP" = "dashed")) +
+  scale_x_continuous(breaks = unique(all_counts_filtered_long$time_point)) +
+  theme(
+    aspect.ratio = 1,
+    strip.text = element_text(size = 12)
+  )
+
+#ggsave(
+#  path = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/figures/",
+#  filename = "LINC00667_GFP_sig_peak_counts_match.pdf",
+#  height = 20, width = 30, limitsize = FALSE
+#)
+
+ggsave(
+  path = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/LINC00667/figures/",
+  filename = "LINC00667_GFP_sig_peak_counts.pdf",
+  height = 40, width = 30, limitsize = FALSE
+)
+```
+
